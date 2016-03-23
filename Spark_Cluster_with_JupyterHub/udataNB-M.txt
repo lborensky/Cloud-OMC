@@ -1,0 +1,122 @@
+#!/bin/bash
+#
+# Cloud-init script to get Spark Master up and running
+#
+echo "DEBUT INSTALLATION" > /root/bootVM.log
+(
+  # redimensionnement partition root via LVM
+  parted /dev/vda mkpart primary ext4 11GB 50GB 
+  pvcreate /dev/vda3
+  vgextend rootvg /dev/vda3
+  lvextend --size 38G /dev/rootvg/rootlv 
+  resize2fs /dev/rootvg/rootlv 38G
+
+  SPARK_VERSION="1.6.0"
+  APACHE_MIRROR="apache.uib.no"
+  LOCALNET="10.0.0.0/24"
+
+  # Firewall setup
+  #ufw allow from $LOCALNET
+  #ufw allow 80/tcp
+  #ufw allow 443/tcp
+  #ufw allow 4040:4050/tcp
+  #ufw allow 7077/tcp
+  #ufw allow 8080/tcp
+
+  # Dependencies
+  apt-get -y update
+  apt-get -y install openjdk-7-jdk
+
+  # Download and unpack Spark
+  curl -o /tmp/spark-$SPARK_VERSION-bin-hadoop1.tgz http://$APACHE_MIRROR/spark/spark-$SPARK_VERSION/spark-$SPARK_VERSION-bin-hadoop1.tgz
+  tar xvz -C /opt -f /tmp/spark-$SPARK_VERSION-bin-hadoop1.tgz
+  ln -s /opt/spark-$SPARK_VERSION-bin-hadoop1/ /opt/spark
+  chown -R root:root /opt/spark-$SPARK_VERSION-bin-hadoop1/*
+
+  # Configure Spark master
+  cp /opt/spark/conf/spark-env.sh.template /opt/spark/conf/spark-env.sh
+  sed -i 's/# - SPARK_MASTER_OPTS.*/SPARK_MASTER_OPTS="-Dspark.deploy.defaultCores=2 -Dspark.executor.memory=1G"/' /opt/spark/conf/spark-env.sh
+
+  # Make sure our hostname is resolvable by adding it to /etc/hosts
+  echo $(ip -o addr show dev eth0 | fgrep "inet " | egrep -o '[0-9.]+/[0-9]+' | cut -f1 -d/) $HOSTNAME | sudo tee -a /etc/hosts
+
+  # Start Spark Master with IP address of eth0 as the address to use
+  /opt/spark/sbin/start-master.sh -h $(ip -o addr show dev eth0 | fgrep "inet " | egrep -o '[0-9.]+/[0-9]+' | cut -f1 -d/)
+
+  # install other components
+  apt-get install unzip
+  apt-get -y install python3-pip npm nodejs-legacy 
+  npm install -g configurable-http-proxy 
+  pip3 install jupyterhub
+  pip3 install "ipython[notebook]"
+
+  jupyterhub --no-ssl --port 80 > /var/log/jupyperhub.log 2>&1 & 
+  
+  apt-get -y install python-dev python-setuptools
+  apt-get install python-pandas
+  apt-get install libfreetype6-dev libxft-dev
+  apt-get install blt-dev
+
+  pip install -U matplotlib
+  pip install -U scikit-learn
+  pip install -U seaborn
+
+  wget https://bootstrap.pypa.io/get-pip.py
+  python get-pip.py
+  pip install py4j 
+  pip install "ipython[notebook]"
+   
+  mkdir -p /usr/local/share/jupyter/kernels/pyspark/ 
+  cat << EOF_1 | sudo tee /usr/local/share/jupyter/kernels/pyspark/kernel.json
+  {
+    "display_name": "PySpark (Python2.7)",
+    "language": "python",
+    "argv": [
+      "/usr/bin/python2",
+      "-m",
+      "ipykernel",
+      "-f",
+      "{connection_file}"
+    ],
+    "env": {
+      "SPARK_HOME": "/opt/spark/",
+      "PYTHONPATH": "/opt/spark/python/:/opt/spark/python/lib/py4j-0.8.2.1-src.zip",
+      "PYTHONSTARTUP": "/opt/spark/python/pyspark/shell.py",
+      "PYSPARK_SUBMIT_ARGS": "--master spark://10.0.0.222:7077 pyspark-shell"
+    }
+  }
+EOF_1
+  
+  IP=$(hostname -i | awk '{ print $2 }')
+  sed -ie "s/^\(.*PYSPARK_SUBMIT_ARGS.*spark\):.*:\(.*\)$/\1:\/\/${IP}:\2/" \
+    /usr/local/share/jupyter/kernels/pyspark/kernel.json
+  
+  # extract pykernel sparc to default repository
+  (
+    cd /usr/local/lib/python2.7/dist-packages
+    cp /opt/spark/python/lib/pyspark.zip .
+    unzip pyspark.zip; rm -f pyspark.zip
+  )
+  
+  mkdir -p /root/bin
+  cat << EOF_2 > /root/bin/scuser.sh
+    #/bin/bash
+    if [ \$# -ne 2 ]; then
+      echo "Error, Syntax: \$0 user passwd"
+      exit 1
+    else
+      useradd -m \$1
+      echo -e "\$2\n\$2" | passwd -q \$1
+      sudo su \$1 << EOF_3
+        cd
+        echo "export PYTHONPATH=/usr/local/lib/python1.7/dist-packages:/usr/lib/python2.7:/opt/spark/python/lib:" >> .bashrc
+        echo "export SPARK_HOME=/opt/spark" >> .bashrc
+EOF_3
+    fi
+EOF_2
+  
+   chmod 755 /root/bin/scuser.sh
+
+) >> /root/bootVM.log 2>&1
+
+echo "FIN INSTALLATION" >> /root/bootVM.log

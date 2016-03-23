@@ -1,0 +1,42 @@
+#!/bin/bash
+#
+# Cloud-init script to get Spark Master up and running
+#
+echo "DEBUT INSTALLATION" > /root/bootVM.log
+
+(
+  # redimensionnement partition root via LVM
+  parted /dev/vda mkpart primary ext4 11GB 50GB 
+  pvcreate /dev/vda3
+  vgextend rootvg /dev/vda3
+  lvextend --size 38G /dev/rootvg/rootlv 
+  resize2fs /dev/rootvg/rootlv 38G
+
+  SPARK_VERSION="1.6.0"
+  APACHE_MIRROR="apache.uib.no"
+  LOCALNET="10.0.0.0/24"
+  # adresse IP locale de la VM master mise à jour automatique (si nécessaire) par le script Python lançant les workers
+  SPARK_MASTER_IP="10.0.0.253"
+
+  # Firewall setup
+  # ufw allow from $LOCALNET
+  # ufw allow 8081/tcp
+
+  # Dependencies
+  apt-get -y update
+  apt-get -y install openjdk-7-jdk
+  
+  # Download and unpack Spark
+  curl -o /tmp/spark-$SPARK_VERSION-bin-hadoop1.tgz http://$APACHE_MIRROR/spark/spark-$SPARK_VERSION/spark-$SPARK_VERSION-bin-hadoop1.tgz
+  tar xvz -C /opt -f /tmp/spark-$SPARK_VERSION-bin-hadoop1.tgz
+  ln -s /opt/spark-$SPARK_VERSION-bin-hadoop1/ /opt/spark
+  chown -R root:root /opt/spark-$SPARK_VERSION-bin-hadoop1/*
+
+  # Make sure our hostname is resolvable by adding it to /etc/hosts
+  echo $(ip -o addr show dev eth0 | fgrep "inet " | egrep -o '[0-9.]+/[0-9]+' | cut -f1 -d/) $HOSTNAME | sudo tee -a /etc/hosts
+
+  # Start Spark worker with address of Spark master to join cluster 
+  /opt/spark/sbin/start-slave.sh spark://$SPARK_MASTER_IP:7077
+) >>/root/bootVM.log 2>&1
+
+echo "FIN INSTALLATION" >> /root/bootVM.log

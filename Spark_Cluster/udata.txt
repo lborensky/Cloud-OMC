@@ -1,0 +1,160 @@
+#!/bin/bash
+echo "DEBUT INSTALLATION" > /root/bootVM.log
+(
+  # update system environment and components installation
+  sudo apt-get -qq update
+  sudo apt-get -y -qq upgrade
+  sudo apt-get install -y python-pip python-dev fabric git
+  
+  # redimensionnement partition root via LVM
+  sudo parted /dev/vda mkpart primary ext4 11GB 50GB 
+  sudo pvcreate /dev/vda3
+  sudo vgextend rootvg /dev/vda3
+  sudo lvextend --size 38G /dev/rootvg/rootlv 
+  sudo resize2fs /dev/rootvg/rootlv 38G
+
+  # création du compte 'hduser' est d'une paire de clés 
+  export USER=hduser
+  export DOWNLOAD_DIR=/tmp
+
+  sudo useradd $USER -m
+  (
+    sudo su $USER << EOF
+    cd
+    ssh-keygen -t rsa -f /home/$USER/.ssh/id_rsa -q -P ''
+    chmod 0600 /home/$USER/.ssh/id_rsa*
+  
+    cat ~/.ssh/id_rsa.pub > ~/.ssh/authorized_keys
+    chmod 0600 /home/$USER/.ssh/authorized_keys
+EOF
+  )
+
+  sudo sed -i 's/^hduser\(.*\)$/hduser\1\/bin\/bash/' /etc/passwd
+  sudo echo "$USER ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$USER
+  sudo chmod 0440 /etc/sudoers.d/$USER
+
+  # le fichier "config_files.tgz" est remonté par le script Python de démarrage de la VM, soit
+  # à la fin du boot de la VM (une fois ACTIVE)
+  USER_DIR=/home/$USER
+  echo "attente réception du package (tgz) de config_files"
+  while true
+  do
+    if [ ! -f $DOWNLOAD_DIR/config_files.tar.gz ]; then
+      sleep 5
+      continue
+    else
+      (cd $USER_DIR; tar zxfv /tmp/config_files.tar.gz)
+      break
+    fi
+  done
+  echo "installation package (tgz) config_files effectuée"
+
+  # installation des composants [Spark + Hadoop, Scala, iPython et Java]
+  export INSTALL_DIR=/usr/local
+  export CONF_FILES_DIR=/home/$USER/config_files
+  export ENV_VARS=/home/$USER/.pam.env
+
+  export HADOOP_DIR=$INSTALL_DIR/hadoop
+  export HADOOP_HOME=$HADOOP_DIR
+  export HADOOP_CONF_DIR=$HADOOP_DIR/etc/hadoop
+  export HADOOP_LIB_DIR=$HADOOP_DIR/libexec
+
+  export SPARK_DIR=$INSTALL_DIR/spark
+  export SPARK_HOME=$SPARK_DIR
+  export SPARK_CONF_DIR=$SPARK_DIR/conf
+
+  export SCALA_DIR=$INSTALL_DIR/scala
+  export SCALA_HOME=$SCALA_DIR
+
+  echo "1. Installation de Java et configuration environnement"
+
+  sudo apt-get install -y -qq openjdk-7-jdk
+  sudo ln -s /usr/lib/jvm/java-7-openjdk-amd64 /usr/lib/jvm/default-java
+
+  echo "export JAVA_HOME=/usr/lib/jvm/java-7-openjdk-amd64" >> $ENV_VARS
+  echo "export HADOOP_HOME=$INSTALL_DIR/hadoop" >> $ENV_VARS
+  echo "export HADOOP_DATA_DIR=/home/$USER/data" >> $ENV_VARS
+  echo "export HADOOP_PREFIX=$HADOOP_DIR" >> $ENV_VARS
+  echo "export YARN_HOME=$INSTALL_DIR/hadoop" >> $ENV_VARS
+  echo "export HADOOP_CONF_DIR=$INSTALL_DIR/hadoop/etc/hadoop" >> $ENV_VARS
+  echo "export YARN_CONF_DIR=$INSTALL_DIR/hadoop/etc/hadoop" >> $ENV_VARS
+  echo "export SCALA_HOME=$INSTALL_DIR/scala" >> $ENV_VARS
+  echo "export SPARK_HOME=$INSTALL_DIR/spark" >> $ENV_VARS 
+  echo "export SPARK_CONF_DIR=$INSTALL_DIR/spark/conf" >> $ENV_VARS
+  echo "source $ENV_VARS" >> /home/$USER/.bashrc
+
+  echo "2. Installation de Hadoop & Spark"
+  HADOOP_RELEASE=hadoop-2.4.0
+  # wget https://archive.apache.org/dist/hadoop/core/$HADOOP_RELEASE/$HADOOP_RELEASE.tar.gz -P $DOWNLOAD_DIR
+  (cd $DOWNLOAD_DIR; wget https://www.dropbox.com/s/4u3gkf5efpdx4op/${HADOOP_RELEASE}.tar.gz)
+  (cd $DOWNLOAD_DIR; tar -xzf ${HADOOP_RELEASE}.tar.gz)
+  (cd $DOWNLOAD_DIR; sudo mv $HADOOP_RELEASE $HADOOP_HOME)
+  (cd $DOWNLOAD_DIR; rm -f ${HADOOP_RELEASE}.tar.gz)
+      
+  SPARK_RELEASE=spark-1.4.1
+  # wget http://apache.mirrors.ovh.net/ftp.apache.org/dist/spark/spark-1.6.0/spark-1.6.0-bin-hadoop2.6.tgz -p $DONWLOAD_DIR
+  (cd $DOWNLOAD_DIR; wget http://d3kbcqa49mib13.cloudfront.net/${SPARK_RELEASE}-bin-hadoop2.4.tgz)
+  (cd $DOWNLOAD_DIR; tar -zxf $DOWNLOAD_DIR/${SPARK_RELEASE}-bin-hadoop2.4.tgz)
+  (cd $DOWNLOAD_DIR; sudo mv ${SPARK_RELEASE}-bin-hadoop2.4 ${SPARK_HOME})
+  (cd $DOWNLOAD_DIR; rm -f ${SPARK_RELEASE}-bin-hadoop2.4.tgz)
+
+  sudo  mkdir -p /home/$USER/data/hadoop/hdfs
+
+  # fichiers de configuration pré-établis pour Hadoop
+  sudo cp $CONF_FILES_DIR/core-site.xml $HADOOP_CONF_DIR/
+  sudo cp $CONF_FILES_DIR/mapred-site.xml $HADOOP_CONF_DIR/
+  sudo cp $CONF_FILES_DIR/hdfs-site.xml $HADOOP_CONF_DIR/
+  sudo cp $CONF_FILES_DIR/yarn-site.xml $HADOOP_CONF_DIR/
+  sudo cp $CONF_FILES_DIR/yarn-site.xml.slave $HADOOP_CONF_DIR/
+  sudo cp $CONF_FILES_DIR/yarn-env.sh $HADOOP_CONF_DIR/
+  sudo cp $CONF_FILES_DIR/hadoop-config.sh $HADOOP_LIB_DIR/
+  sudo cp $CONF_FILES_DIR/spark-env.sh $SPARK_CONF_DIR/
+
+  sudo cp $CONF_FILES_DIR/ssh_config /home/$USER/.ssh/config
+    
+  sudo echo "export PATH=\$PATH:\$HADOOP_HOME/bin:\$HADOOP_HOME/sbin" >> $ENV_VARS
+  sudo echo "export HADOOP_NAMENODE_USER=$USER" >> $ENV_VARS
+  sudo echo "export HADOOP_DATANODE_USER=$USER" >> $ENV_VARS
+  sudo echo "export HADOOP_SECONDARYNAMENODE_USER=$USER" >> $ENV_VARS
+  sudo echo "export HADOOP_JOBTRACKER_USER=$USER" >> $ENV_VARS
+  sudo echo "export HADOOP_TASKTRACKER_USER=$USER" >> $ENV_VARS
+
+  sudo mkdir -p /var/lib/spark/{work,rdd,pid}
+  sudo mkdir -p /var/log/spark
+  sudo chown -R $USER:$USER /var/lib/spark
+  sudo chown -R $USER:$USER /var/log/spark
+
+  # fichiers de configuration pré-établis pour Spark
+  sudo cp $CONF_FILES_DIR/spark-env.sh $SPARK_CONF_DIR/
+  sudo cp $CONF_FILES_DIR/spark-defaults.conf $SPARK_CONF_DIR/
+  sudo cp $SPARK_CONF_DIR/log4j.properties.template $SPARK_CONF_DIR/log4j.properties
+
+  sudo echo 'MASTER=spark://$(hostname -I | awk '"'{ print \$1 }'"'):7077' >> $ENV_VARS
+  sudo echo "export PATH=\$PATH:\$SPARK_HOME/bin:\$SPARK_HOME/sbin" >> $ENV_VARS
+
+  echo "3. Installation de Scala"
+  SCALA_RELEASE=scala-2.11.7
+  (cd $DOWNLOAD_DIR; wget http://downloads.lightbend.com/scala/2.11.7/scala-2.11.7.tgz)
+  (cd $DOWNLOAD_DIR; tar -zxf ${SCALA_RELEASE}.tgz )
+  sudo mv $DOWNLOAD_DIR/$SCALA_RELEASE $SCALA_HOME
+ 
+  sudo echo "export PATH=\$PATH:\$SCALA_HOME/bin" >> $ENV_VARS
+
+  echo "4. Installation de iPython"
+  source /home/$USER/.bashrc
+
+  sudo apt-get install -y python-matplotlib
+  sudo pip install pandas py4j ipython['all']
+      
+  # fichiers de configuration pré-établis pour iPython 
+  sudo mkdir -p /home/$USER/.ipython/profile_nbserver/startup
+  sudo cp $CONF_FILES_DIR/ipython_notebook_config.py /home/$USER/.ipython/profile_nbserver/
+  sudo cp $CONF_FILES_DIR/00-pyspark-setup.py /home/$USER/.ipython/profile_nbserver/startup/
+  sudo cp $CONF_FILES_DIR/start_notebook.sh /home/$USER
+  sudo cp $CONF_FILES_DIR/fabfile.py /home/$USER
+
+  # post-installation
+  sudo chown -R root:root ${SCALA_HOME:-"/usr/local/scala"}
+  sudo chown -R $USER:$USER $HADOOP_HOME $SPARK_HOME /home/$USER
+) >> /root/bootVM.log 2>&1
+echo "FIN INSTALLATION" >> /root/bootVM.log
